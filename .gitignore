@@ -1,0 +1,9 @@
+# Generated reports
+NW_Report_*.html
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store

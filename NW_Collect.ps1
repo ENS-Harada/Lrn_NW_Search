@@ -1,0 +1,471 @@
+﻿# ============================================================
+#  ライフリズムナビ NW情報収集ツール
+#  バッチファイルから呼び出されるPowerShellスクリプト
+# ============================================================
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+Write-Host ""
+Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Blue
+Write-Host "  ║  ライフリズムナビ NW情報収集ツール       ║" -ForegroundColor Blue
+Write-Host "  ║  ネットワーク情報を自動収集しています... ║" -ForegroundColor Blue
+Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Blue
+Write-Host ""
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $scriptDir) { $scriptDir = Get-Location }
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$outputFile = Join-Path $scriptDir "NW_Report_$timestamp.html"
+
+# =====================
+#  1. Wi-Fi情報の取得
+# =====================
+Write-Host "  [1/4] Wi-Fi接続情報を取得中..." -ForegroundColor Cyan
+
+$wifi = @{
+    SSID       = "（未接続）"
+    Auth       = "−"
+    Cipher     = "−"
+    Signal     = "−"
+    RadioType  = "−"
+    Channel    = "−"
+    BSSID      = "−"
+}
+
+try {
+    $wlanOutput = netsh wlan show interfaces 2>$null
+    if ($wlanOutput) {
+        foreach ($line in $wlanOutput) {
+            if ($line -match '^\s+SSID\s+:\s+(.+)$') { $wifi.SSID = $Matches[1].Trim() }
+            if ($line -match '^\s+BSSID\s+:\s+(.+)$') { $wifi.BSSID = $Matches[1].Trim() }
+            if ($line -match '認証\s+:\s+(.+)$' -or $line -match 'Authentication\s+:\s+(.+)$') { $wifi.Auth = $Matches[1].Trim() }
+            if ($line -match '暗号\s+:\s+(.+)$' -or $line -match 'Cipher\s+:\s+(.+)$') { $wifi.Cipher = $Matches[1].Trim() }
+            if ($line -match 'シグナル\s+:\s+(.+)$' -or $line -match 'Signal\s+:\s+(.+)$') { $wifi.Signal = $Matches[1].Trim() }
+            if ($line -match '無線の種類\s+:\s+(.+)$' -or $line -match 'Radio type\s+:\s+(.+)$') { $wifi.RadioType = $Matches[1].Trim() }
+            if ($line -match 'チャネル\s+:\s+(.+)$' -or $line -match 'Channel\s+:\s+(.+)$') {
+                if ($line -notmatch '無線|Radio') { $wifi.Channel = $Matches[1].Trim() }
+            }
+        }
+    }
+} catch { }
+
+# =====================
+#  2. IP情報の取得
+# =====================
+Write-Host "  [2/4] IPアドレス情報を取得中..." -ForegroundColor Cyan
+
+$ip = @{
+    Address   = "−"
+    Mask      = "−"
+    Gateway   = "−"
+    DNS1      = "−"
+    DNS2      = "−"
+    DHCP      = "−"
+    MAC       = "−"
+    Hostname  = $env:COMPUTERNAME
+}
+
+try {
+    # アクティブなネットワークアダプタからIP情報を取得
+    $adapters = Get-NetIPConfiguration -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPv4DefaultGateway -ne $null
+    } | Select-Object -First 1
+
+    if ($adapters) {
+        $ip.Address = ($adapters.IPv4Address | Select-Object -First 1).IPAddress
+        $ip.Gateway = ($adapters.IPv4DefaultGateway | Select-Object -First 1).NextHop
+
+        $ifIndex = $adapters.InterfaceIndex
+        $adapterConfig = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($adapterConfig) {
+            $prefixLen = $adapterConfig.PrefixLength
+            # プレフィックス長からサブネットマスクを計算
+            $maskBits = ('1' * $prefixLen).PadRight(32, '0')
+            $ip.Mask = "{0}.{1}.{2}.{3}" -f `
+                [Convert]::ToInt32($maskBits.Substring(0,8), 2),
+                [Convert]::ToInt32($maskBits.Substring(8,8), 2),
+                [Convert]::ToInt32($maskBits.Substring(16,8), 2),
+                [Convert]::ToInt32($maskBits.Substring(24,8), 2)
+        }
+
+        $dnsServers = ($adapters.DNSServer | Where-Object { $_.AddressFamily -eq 2 }).ServerAddresses
+        if ($dnsServers -and $dnsServers.Count -ge 1) { $ip.DNS1 = $dnsServers[0] }
+        if ($dnsServers -and $dnsServers.Count -ge 2) { $ip.DNS2 = $dnsServers[1] }
+
+        $netAdapter = Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue
+        if ($netAdapter) { $ip.MAC = $netAdapter.MacAddress }
+
+        $dhcpEnabled = (Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
+        $ip.DHCP = if ($dhcpEnabled -eq 'Enabled') { "有効" } else { "無効（固定IP）" }
+    }
+} catch {
+    # フォールバック: ipconfig /all からパース
+    try {
+        $ipconfigOutput = ipconfig /all 2>$null
+        foreach ($line in $ipconfigOutput) {
+            if ($line -match 'IPv4.*:\s+([\d\.]+)') { if ($ip.Address -eq "−") { $ip.Address = $Matches[1] } }
+            if ($line -match '(サブネット|Subnet).*:\s+([\d\.]+)') { if ($ip.Mask -eq "−") { $ip.Mask = $Matches[2] } }
+            if ($line -match '(デフォルト|Default).*:\s+([\d\.]+)') { if ($ip.Gateway -eq "−") { $ip.Gateway = $Matches[2] } }
+            if ($line -match 'DNS.*:\s+([\d\.]+)') {
+                if ($ip.DNS1 -eq "−") { $ip.DNS1 = $Matches[1] }
+                elseif ($ip.DNS2 -eq "−") { $ip.DNS2 = $Matches[1] }
+            }
+            if ($line -match '(物理|Physical).*:\s+([\w-]+)') { if ($ip.MAC -eq "−") { $ip.MAC = $Matches[2] } }
+        }
+    } catch { }
+}
+
+# =====================
+#  3. インターネット接続確認
+# =====================
+Write-Host "  [3/4] インターネット接続を確認中..." -ForegroundColor Cyan
+
+$netStatus = "NG"
+try {
+    $pingResult = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
+    if ($pingResult) { $netStatus = "OK" }
+} catch { }
+
+# =====================
+#  4. HTMLレポート生成
+# =====================
+Write-Host "  [4/4] レポートを生成中..." -ForegroundColor Cyan
+
+$badgeClass = if ($netStatus -eq "OK") { "badge-ok" } else { "badge-ng" }
+$badgeText = if ($netStatus -eq "OK") { "接続OK" } else { "接続NG" }
+$dateStr = Get-Date -Format "yyyy/MM/dd HH:mm"
+
+$html = @"
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NW情報収集レポート</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI','Meiryo','Yu Gothic',sans-serif; background:#f0f4f8; color:#1a202c; padding:20px; }
+.container { max-width:820px; margin:0 auto; }
+.header { background:linear-gradient(135deg,#2563eb,#1d4ed8); color:#fff; padding:24px 32px; border-radius:12px 12px 0 0; }
+.header h1 { font-size:22px; font-weight:700; }
+.header p { font-size:13px; opacity:0.85; margin-top:4px; }
+.badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+.badge-ok { background:#10b981; color:#fff; }
+.badge-ng { background:#ef4444; color:#fff; }
+.card { background:#fff; border-radius:0 0 12px 12px; box-shadow:0 2px 8px rgba(0,0,0,0.08); margin-bottom:20px; overflow:hidden; }
+.card + .card, .card + .manual-section, .manual-section + .card { border-radius:12px; }
+.section { padding:20px 32px; border-bottom:1px solid #e5e7eb; }
+.section:last-child { border-bottom:none; }
+.section-title { font-size:15px; font-weight:700; color:#2563eb; margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+.section-title .icon { font-size:18px; }
+table { width:100%; border-collapse:collapse; }
+td { padding:10px 12px; font-size:14px; border-bottom:1px solid #f1f5f9; }
+td:first-child { color:#64748b; font-weight:500; width:220px; }
+td:last-child { color:#1e293b; font-weight:600; }
+.auto-tag { font-size:10px; color:#10b981; font-weight:600; margin-left:6px; }
+.manual-section { background:#fffbeb; border:2px solid #fbbf24; border-radius:12px; margin-bottom:20px; }
+.manual-section .section-title { color:#d97706; }
+.manual-section .note { font-size:12px; color:#92400e; background:#fef3c7; padding:8px 12px; border-radius:6px; margin-bottom:14px; }
+input[type="text"], select, textarea { width:100%; padding:10px 14px; border:2px solid #e2e8f0; border-radius:8px; font-size:14px; font-family:inherit; transition:border-color 0.2s; }
+input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,0.1); }
+.form-row { display:flex; gap:16px; margin-bottom:12px; }
+.form-group { flex:1; }
+.form-group label { display:block; font-size:12px; font-weight:600; color:#64748b; margin-bottom:4px; }
+.btn-group { display:flex; gap:12px; justify-content:center; padding:24px; flex-wrap:wrap; }
+.btn { padding:12px 32px; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; border:none; transition:all 0.2s; }
+.btn-primary { background:#2563eb; color:#fff; }
+.btn-primary:hover { background:#1d4ed8; transform:translateY(-1px); }
+.btn-secondary { background:#f1f5f9; color:#475569; }
+.btn-secondary:hover { background:#e2e8f0; }
+.btn-success { background:#10b981; color:#fff; }
+.btn-success:hover { background:#059669; }
+.footer { text-align:center; padding:16px; color:#94a3b8; font-size:12px; }
+.tip { font-size:11px; color:#94a3b8; margin-top:4px; }
+@media print { body{background:#fff;} .btn-group{display:none;} .manual-section{border-color:#ccc; page-break-before:always;} .facility-card{page-break-before:always;} input,select,textarea{border-color:#ccc;} .footer{page-break-before:avoid;} }
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- ヘッダー -->
+<div class="header">
+<h1>&#128225; NW情報収集レポート</h1>
+<p>ライフリズムナビ 導入前ネットワーク調査</p>
+<p style="margin-top:8px">取得日時: $dateStr ／ PC名: $($ip.Hostname) ／ インターネット: <span class="badge $badgeClass">$badgeText</span></p>
+</div>
+
+<!-- 自動取得: Wi-Fi -->
+<div class="card">
+<div class="section">
+<div class="section-title"><span class="icon">&#128246;</span> Wi-Fi接続情報 <span class="auto-tag">&#10003; 自動取得</span></div>
+<table>
+<tr><td>SSID（ネットワーク名）</td><td>$($wifi.SSID)</td></tr>
+<tr><td>認証方式</td><td>$($wifi.Auth)</td></tr>
+<tr><td>暗号化方式</td><td>$($wifi.Cipher)</td></tr>
+<tr><td>電波強度</td><td>$($wifi.Signal)</td></tr>
+<tr><td>無線規格</td><td>$($wifi.RadioType)</td></tr>
+<tr><td>チャネル</td><td>$($wifi.Channel)</td></tr>
+<tr><td>BSSID（APのMACアドレス）</td><td>$($wifi.BSSID)</td></tr>
+<tr><td>PCのMACアドレス</td><td>$($ip.MAC)</td></tr>
+</table>
+</div>
+
+<!-- 自動取得: IP -->
+<div class="section">
+<div class="section-title"><span class="icon">&#127760;</span> IPアドレス情報 <span class="auto-tag">&#10003; 自動取得</span></div>
+<table>
+<tr><td>IPアドレス</td><td>$($ip.Address)</td></tr>
+<tr><td>サブネットマスク</td><td>$($ip.Mask)</td></tr>
+<tr><td>デフォルトゲートウェイ</td><td>$($ip.Gateway)</td></tr>
+<tr><td>DNSサーバー（プライマリ）</td><td>$($ip.DNS1)</td></tr>
+<tr><td>DNSサーバー（セカンダリ）</td><td>$($ip.DNS2)</td></tr>
+<tr><td>DHCP</td><td>$($ip.DHCP)</td></tr>
+</table>
+</div>
+
+</div>
+
+<!-- 手動入力セクション -->
+<div class="manual-section">
+<div class="section" style="padding-bottom:8px">
+<div class="section-title"><span class="icon">&#9999;&#65039;</span> 手動入力項目</div>
+<div class="note">以下はPCから自動取得できない項目です。分かる範囲でご記入ください。不明な場合は空欄のままで大丈夫です。</div>
+</div>
+
+<div class="section">
+<div class="form-row">
+<div class="form-group">
+<label>Wi-Fiパスワード</label>
+<input type="text" id="wifiPass" placeholder="お客様のIT担当者に確認">
+</div>
+<div class="form-group">
+<label>周波数帯（推奨: 5GHz）</label>
+<select id="freqBand">
+<option value="">-- 選択 --</option>
+<option value="2.4GHz">2.4GHz</option>
+<option value="5GHz">5GHz（推奨）</option>
+<option value="2.4GHz / 5GHz 両方">両方</option>
+<option value="不明">不明</option>
+</select>
+<p class="tip">※ ライフリズムナビは5GHz推奨です</p>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-group">
+<label>プライバシーセパレータ</label>
+<select id="privSep">
+<option value="">-- 選択 --</option>
+<option value="OFF（正常）">OFF（正常）</option>
+<option value="ON（要変更）">ON（要変更 ※カメラ映像閲覧不可）</option>
+<option value="不明（要確認）">不明（要確認）</option>
+</select>
+<p class="tip">※ カメラ設置時はOFF必須</p>
+</div>
+<div class="form-group">
+<label>MACアドレス認証</label>
+<select id="macAuth">
+<option value="">-- 選択 --</option>
+<option value="なし">なし</option>
+<option value="あり（要登録）">あり（要登録）</option>
+<option value="不明（要確認）">不明（要確認）</option>
+</select>
+<p class="tip">※ ありの場合、全デバイスのMAC登録が必要</p>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-group">
+<label>固定IPの払い出し可否</label>
+<select id="staticIP">
+<option value="">-- 選択 --</option>
+<option value="払い出し可能">払い出し可能</option>
+<option value="払い出し不可">払い出し不可</option>
+<option value="要確認">要確認</option>
+</select>
+</div>
+<div class="form-group">
+<label>払い出し可能な固定IPアドレス</label>
+<input type="text" id="availIP" placeholder="例: 192.168.1.100 ～ 110">
+<p class="tip">※ カメラ・SIPサーバー・監視用GW分を含む</p>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-group">
+<label>UTM / ファイアウォールの有無</label>
+<select id="utmFw">
+<option value="">-- 選択 --</option>
+<option value="なし">なし</option>
+<option value="あり">あり（ホワイトリスト設定が必要）</option>
+<option value="不明">不明</option>
+</select>
+</div>
+<div class="form-group">
+<label>プロキシ環境</label>
+<select id="proxy">
+<option value="">-- 選択 --</option>
+<option value="なし">なし</option>
+<option value="あり">あり（GWにプロキシ設定で対応可）</option>
+<option value="不明">不明</option>
+</select>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-group">
+<label>キャプティブポータル（ログイン画面）の有無</label>
+<select id="captive">
+<option value="">-- 選択 --</option>
+<option value="なし">なし</option>
+<option value="あり（要対策）">あり（※GW接続不可のため要対策）</option>
+<option value="不明">不明</option>
+</select>
+</div>
+<div class="form-group">
+<label>VLAN分割の有無</label>
+<select id="vlan">
+<option value="">-- 選択 --</option>
+<option value="なし">なし（フラットネットワーク）</option>
+<option value="あり">あり（ルーティング設定要確認）</option>
+<option value="不明">不明</option>
+</select>
+</div>
+</div>
+
+<div class="form-group" style="padding:0 32px 16px">
+<label>備考・特記事項</label>
+<textarea id="notes" rows="3" placeholder="NW構成図の有無、特殊なネットワーク構成、ルーター機種名など"></textarea>
+</div>
+
+</div>
+</div>
+
+<!-- 施設情報 -->
+<div class="card facility-card">
+<div class="section">
+<div class="section-title"><span class="icon">&#127970;</span> 施設情報</div>
+<div class="form-row">
+<div class="form-group">
+<label>施設名</label>
+<input type="text" id="facName" placeholder="施設名を入力">
+</div>
+<div class="form-group">
+<label>担当者名（記入者）</label>
+<input type="text" id="staff" placeholder="記入者名">
+</div>
+</div>
+<div class="form-group">
+<label>調査場所（フロア・居室番号など）</label>
+<input type="text" id="location" placeholder="例: 3F ナースステーション付近">
+</div>
+</div>
+</div>
+
+<!-- ボタン -->
+<div class="btn-group">
+<button class="btn btn-primary" onclick="copyAll()">&#128203; テキストコピー</button>
+<button class="btn btn-success" onclick="saveLocal()">&#128190; 保存（HTML）</button>
+<button class="btn btn-secondary" onclick="window.print()">&#128424; 印刷 / PDF保存</button>
+</div>
+
+<div class="footer">
+ライフリズムナビ NW情報収集ツール v1.0 &mdash; エコナビスタ株式会社
+</div>
+
+</div>
+
+<script>
+function gatherText() {
+    var L = [];
+    L.push('=== ライフリズムナビ NW情報収集レポート ===');
+    L.push('取得日時: $dateStr');
+    L.push('PC名: $($ip.Hostname)');
+    L.push('インターネット: $netStatus');
+    L.push('');
+    L.push('【施設情報】');
+    L.push('施設名: ' + v('facName'));
+    L.push('担当者: ' + v('staff'));
+    L.push('調査場所: ' + v('location'));
+    L.push('');
+    L.push('【Wi-Fi情報（自動取得）】');
+    L.push('SSID: $($wifi.SSID)');
+    L.push('認証方式: $($wifi.Auth)');
+    L.push('暗号化: $($wifi.Cipher)');
+    L.push('電波強度: $($wifi.Signal)');
+    L.push('無線規格: $($wifi.RadioType)');
+    L.push('チャネル: $($wifi.Channel)');
+    L.push('BSSID: $($wifi.BSSID)');
+    L.push('PCのMAC: $($ip.MAC)');
+    L.push('');
+    L.push('【IP情報（自動取得）】');
+    L.push('IPアドレス: $($ip.Address)');
+    L.push('サブネットマスク: $($ip.Mask)');
+    L.push('デフォルトGW: $($ip.Gateway)');
+    L.push('DNS（プライマリ）: $($ip.DNS1)');
+    L.push('DNS（セカンダリ）: $($ip.DNS2)');
+    L.push('DHCP: $($ip.DHCP)');
+    L.push('');
+    L.push('【手動入力項目】');
+    L.push('Wi-Fiパスワード: ' + v('wifiPass'));
+    L.push('周波数帯: ' + s('freqBand'));
+    L.push('プライバシーセパレータ: ' + s('privSep'));
+    L.push('MACアドレス認証: ' + s('macAuth'));
+    L.push('固定IP払い出し: ' + s('staticIP'));
+    L.push('利用可能固定IP: ' + v('availIP'));
+    L.push('UTM/FW: ' + s('utmFw'));
+    L.push('プロキシ: ' + s('proxy'));
+    L.push('キャプティブポータル: ' + s('captive'));
+    L.push('VLAN: ' + s('vlan'));
+    L.push('備考: ' + v('notes'));
+    return L.join('\n');
+}
+
+function v(id) { return document.getElementById(id).value || '未入力'; }
+function s(id) { var el = document.getElementById(id); return el.options[el.selectedIndex].text || '未選択'; }
+
+function copyAll() {
+    var text = gatherText();
+    navigator.clipboard.writeText(text).then(function() {
+        alert('クリップボードにコピーしました！\nメールやチャットに貼り付けできます。');
+    }).catch(function() {
+        // フォールバック
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        alert('コピーしました！');
+    });
+}
+
+function saveLocal() {
+    // 手動入力値をHTMLに反映して保存
+    var blob = new Blob([document.documentElement.outerHTML], {type:'text/html;charset=utf-8'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    var fname = (document.getElementById('facName').value || 'NW情報') + '_' + new Date().toISOString().slice(0,10) + '.html';
+    a.download = fname;
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+</script>
+
+</body>
+</html>
+"@
+
+# UTF-8 BOM付きで書き出し（ブラウザ互換性のため）
+[System.IO.File]::WriteAllText($outputFile, $html, [System.Text.Encoding]::UTF8)
+
+Write-Host ""
+Write-Host "  ✅ 完了しました！" -ForegroundColor Green
+Write-Host "  📄 保存先: $outputFile" -ForegroundColor White
+Write-Host ""
+
+# ブラウザで開く
+Start-Process $outputFile
+
+Write-Host "  ブラウザでレポートが開きます。このウィンドウは閉じて構いません。" -ForegroundColor Gray
+Start-Sleep -Seconds 5
