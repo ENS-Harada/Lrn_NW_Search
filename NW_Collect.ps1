@@ -20,7 +20,7 @@ $outputFile = Join-Path $scriptDir "NW_Report_$timestamp.html"
 # =====================
 #  1. Wi-Fi情報の取得
 # =====================
-Write-Host "  [1/4] Wi-Fi接続情報を取得中..." -ForegroundColor Cyan
+Write-Host "  [1/5] Wi-Fi接続情報を取得中..." -ForegroundColor Cyan
 
 $wifi = @{
     SSID       = "（未接続）"
@@ -52,7 +52,7 @@ try {
 # =====================
 #  2. IP情報の取得
 # =====================
-Write-Host "  [2/4] IPアドレス情報を取得中..." -ForegroundColor Cyan
+Write-Host "  [2/5] IPアドレス情報を取得中..." -ForegroundColor Cyan
 
 $ip = @{
     Address   = "−"
@@ -118,7 +118,7 @@ try {
 # =====================
 #  3. インターネット接続確認
 # =====================
-Write-Host "  [3/4] インターネット接続を確認中..." -ForegroundColor Cyan
+Write-Host "  [3/5] インターネット接続を確認中..." -ForegroundColor Cyan
 
 $netStatus = "NG"
 try {
@@ -127,9 +127,196 @@ try {
 } catch { }
 
 # =====================
-#  4. HTMLレポート生成
+#  4. IPアドレススキャン
 # =====================
-Write-Host "  [4/4] レポートを生成中..." -ForegroundColor Cyan
+Write-Host "  [4/5] ネットワーク内のIPアドレスをスキャン中..." -ForegroundColor Cyan
+
+$scanResults = @()
+$scanSummary = @{ Total = 0; Used = 0; Available = 0; NetworkAddr = "−"; BroadcastAddr = "−"; PrefixLength = 0; ScanTime = "−" }
+
+try {
+    if ($ip.Address -ne "−" -and $ip.Mask -ne "−") {
+        # IPアドレスとサブネットマスクからネットワーク範囲を計算
+        $ipBytes = [System.Net.IPAddress]::Parse($ip.Address).GetAddressBytes()
+        $maskBytes = [System.Net.IPAddress]::Parse($ip.Mask).GetAddressBytes()
+
+        # プレフィックス長を計算
+        $prefixLength = 0
+        foreach ($b in $maskBytes) {
+            $bits = [Convert]::ToString($b, 2)
+            $prefixLength += ($bits.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+        }
+        $scanSummary.PrefixLength = $prefixLength
+
+        # ネットワークアドレスとブロードキャストアドレスを計算
+        $networkBytes = @(0,0,0,0)
+        $broadcastBytes = @(0,0,0,0)
+        for ($i = 0; $i -lt 4; $i++) {
+            $networkBytes[$i] = $ipBytes[$i] -band $maskBytes[$i]
+            $broadcastBytes[$i] = $ipBytes[$i] -bor (255 - $maskBytes[$i])
+        }
+        $networkAddr = "$($networkBytes[0]).$($networkBytes[1]).$($networkBytes[2]).$($networkBytes[3])"
+        $broadcastAddr = "$($broadcastBytes[0]).$($broadcastBytes[1]).$($broadcastBytes[2]).$($broadcastBytes[3])"
+        $scanSummary.NetworkAddr = $networkAddr
+        $scanSummary.BroadcastAddr = $broadcastAddr
+
+        # ホストIPの範囲を計算（ネットワークアドレス+1 ～ ブロードキャスト-1）
+        $netInt = [uint32]($networkBytes[0]) * 16777216 + [uint32]($networkBytes[1]) * 65536 + [uint32]($networkBytes[2]) * 256 + [uint32]($networkBytes[3])
+        $bcastInt = [uint32]($broadcastBytes[0]) * 16777216 + [uint32]($broadcastBytes[1]) * 65536 + [uint32]($broadcastBytes[2]) * 256 + [uint32]($broadcastBytes[3])
+        $startHost = $netInt + 1
+        $endHost = $bcastInt - 1
+        $totalHosts = $endHost - $startHost + 1
+        $scanSummary.Total = $totalHosts
+
+        # /16以上の大きなサブネットの場合に警告
+        if ($prefixLength -le 16) {
+            Write-Host ""
+            Write-Host "  ⚠ /$prefixLength のネットワークです（$totalHosts ホスト）" -ForegroundColor Yellow
+            Write-Host "  スキャンに30分以上かかる場合があります。しばらくお待ちください..." -ForegroundColor Yellow
+            Write-Host ""
+        } elseif ($prefixLength -le 20) {
+            Write-Host "  ⚠ /$prefixLength のネットワーク（$totalHosts ホスト）- 数分かかります..." -ForegroundColor Yellow
+        }
+
+        $scanStart = Get-Date
+
+        # --- 並列Pingスキャン ---
+        # PowerShell 5.1互換: Runspace Poolで並列実行
+        $maxThreads = 100
+        $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxThreads)
+        $runspacePool.Open()
+
+        $scriptBlock = {
+            param($targetIP)
+            $result = @{ IP = $targetIP; Status = "Available" ; Hostname = "" }
+            try {
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                $reply = $ping.Send($targetIP, 1000)
+                if ($reply.Status -eq 'Success') {
+                    $result.Status = "Used"
+                    try {
+                        $dns = [System.Net.Dns]::GetHostEntry($targetIP)
+                        $result.Hostname = $dns.HostName
+                    } catch { }
+                }
+                $ping.Dispose()
+            } catch { }
+            return $result
+        }
+
+        $jobs = @()
+        $completed = 0
+        $progressInterval = [Math]::Max(1, [Math]::Floor($totalHosts / 50))
+
+        Write-Host "  スキャン開始: $networkAddr/$prefixLength ($totalHosts ホスト)" -ForegroundColor Gray
+
+        for ($hostInt = $startHost; $hostInt -le $endHost; $hostInt++) {
+            $o1 = [Math]::Floor($hostInt / 16777216) % 256
+            $o2 = [Math]::Floor($hostInt / 65536) % 256
+            $o3 = [Math]::Floor($hostInt / 256) % 256
+            $o4 = $hostInt % 256
+            $targetIP = "$o1.$o2.$o3.$o4"
+
+            $ps = [powershell]::Create().AddScript($scriptBlock).AddArgument($targetIP)
+            $ps.RunspacePool = $runspacePool
+            $jobs += @{
+                Pipe = $ps
+                Result = $ps.BeginInvoke()
+                IP = $targetIP
+            }
+
+            # プログレス表示（一定間隔で）
+            if ($jobs.Count % $progressInterval -eq 0 -or $hostInt -eq $endHost) {
+                $pct = [Math]::Floor(($jobs.Count / $totalHosts) * 100)
+                $bar = ('█' * [Math]::Floor($pct / 5)).PadRight(20, '░')
+                Write-Host "`r  [$bar] $pct% ($($jobs.Count)/$totalHosts) 送信中..." -NoNewline -ForegroundColor Cyan
+            }
+        }
+
+        Write-Host ""
+        Write-Host "  応答を待機中..." -ForegroundColor Gray
+
+        # 結果収集
+        foreach ($job in $jobs) {
+            try {
+                $result = $job.Pipe.EndInvoke($job.Result)
+                if ($result) {
+                    $scanResults += $result
+                }
+            } catch { }
+            $job.Pipe.Dispose()
+            $completed++
+
+            if ($completed % $progressInterval -eq 0 -or $completed -eq $jobs.Count) {
+                $pct = [Math]::Floor(($completed / $jobs.Count) * 100)
+                $bar = ('█' * [Math]::Floor($pct / 5)).PadRight(20, '░')
+                Write-Host "`r  [$bar] $pct% ($completed/$($jobs.Count)) 収集中..." -NoNewline -ForegroundColor Cyan
+            }
+        }
+
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+
+        Write-Host ""
+
+        # ARPテーブルも参照して補完（ping応答しないがARP応答するデバイス）
+        Write-Host "  ARPテーブルを確認中..." -ForegroundColor Gray
+        try {
+            $arpOutput = arp -a 2>$null
+            foreach ($line in $arpOutput) {
+                if ($line -match '^\s+([\d\.]+)\s+([\w-]+)\s+(\w+)') {
+                    $arpIP = $Matches[1]
+                    $arpMAC = $Matches[2]
+                    $arpType = $Matches[3]
+                    if ($arpMAC -ne 'ff-ff-ff-ff-ff-ff' -and $arpType -ne 'static') {
+                        $existing = $scanResults | Where-Object { $_.IP -eq $arpIP }
+                        if ($existing -and $existing.Status -eq 'Available') {
+                            $existing.Status = 'Used'
+                        }
+                    }
+                }
+            }
+        } catch { }
+
+        $scanEnd = Get-Date
+        $elapsed = $scanEnd - $scanStart
+        $scanSummary.ScanTime = "{0:mm}分{0:ss}秒" -f $elapsed
+
+        # 集計
+        $scanSummary.Used = ($scanResults | Where-Object { $_.Status -eq 'Used' }).Count
+        $scanSummary.Available = ($scanResults | Where-Object { $_.Status -eq 'Available' }).Count
+
+        Write-Host ""
+        Write-Host "  スキャン完了！ （所要時間: $($scanSummary.ScanTime)）" -ForegroundColor Green
+        Write-Host "  使用中: $($scanSummary.Used) / 空き: $($scanSummary.Available) / 合計: $totalHosts" -ForegroundColor White
+    } else {
+        Write-Host "  ⚠ IPアドレスまたはサブネットマスクが取得できなかったため、スキャンをスキップしました。" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  ⚠ IPスキャン中にエラーが発生しました: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# スキャン結果をHTML用に変数へ格納
+$scanUsedHtml = ""
+$scanAvailHtml = ""
+$scanUsedText = @()
+$scanAvailText = @()
+
+foreach ($r in ($scanResults | Sort-Object { $parts = $_.IP -split '\.'; [uint32]$parts[0]*16777216 + [uint32]$parts[1]*65536 + [uint32]$parts[2]*256 + [uint32]$parts[3] })) {
+    if ($r.Status -eq 'Used') {
+        $hostname = if ($r.Hostname) { " ($($r.Hostname))" } else { "" }
+        $scanUsedHtml += "<span style='display:inline-block;background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;border-radius:4px;padding:2px 8px;margin:2px;font-size:13px;font-family:monospace;'>$($r.IP)$hostname</span>`n"
+        $scanUsedText += "$($r.IP)$hostname"
+    } else {
+        $scanAvailHtml += "<span style='display:inline-block;background:#d1fae5;color:#059669;border:1px solid #6ee7b7;border-radius:4px;padding:2px 8px;margin:2px;font-size:13px;font-family:monospace;'>$($r.IP)</span>`n"
+        $scanAvailText += $r.IP
+    }
+}
+
+# =====================
+#  5. HTMLレポート生成
+# =====================
+Write-Host "  [5/5] レポートを生成中..." -ForegroundColor Cyan
 
 $badgeClass = if ($netStatus -eq "OK") { "badge-ok" } else { "badge-ng" }
 $badgeText = if ($netStatus -eq "OK") { "接続OK" } else { "接続NG" }
@@ -181,7 +368,8 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; 
 .btn-success:hover { background:#059669; }
 .footer { text-align:center; padding:16px; color:#94a3b8; font-size:12px; }
 .tip { font-size:11px; color:#94a3b8; margin-top:4px; }
-@media print { body{background:#fff;} .btn-group{display:none;} .manual-section{border-color:#ccc; page-break-before:always;} .facility-card{page-break-before:always;} input,select,textarea{border-color:#ccc;} .footer{page-break-before:avoid;} }
+.scan-scroll::-webkit-scrollbar { width:6px; } .scan-scroll::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:3px; }
+@media print { body{background:#fff;} .btn-group{display:none;} .manual-section{border-color:#ccc; page-break-before:always;} .facility-card{page-break-before:always;} input,select,textarea{border-color:#ccc;} .footer{page-break-before:avoid;} .scan-scroll{max-height:none !important;overflow:visible !important;} }
 </style>
 </head>
 <body>
@@ -223,6 +411,35 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; 
 </table>
 </div>
 
+</div>
+
+<!-- 自動取得: IPスキャン結果 -->
+<div class="card">
+<div class="section">
+<div class="section-title"><span class="icon">&#128269;</span> IPアドレススキャン結果 <span class="auto-tag">&#10003; 自動取得</span></div>
+<table>
+<tr><td>スキャン範囲</td><td>$($scanSummary.NetworkAddr)/$($scanSummary.PrefixLength)</td></tr>
+<tr><td>ホスト数（合計）</td><td>$($scanSummary.Total)</td></tr>
+<tr><td>使用中 IP</td><td style="color:#dc2626;font-weight:700;">$($scanSummary.Used)</td></tr>
+<tr><td>空き IP</td><td style="color:#059669;font-weight:700;">$($scanSummary.Available)</td></tr>
+<tr><td>スキャン所要時間</td><td>$($scanSummary.ScanTime)</td></tr>
+</table>
+</div>
+
+<div class="section">
+<div class="section-title" style="color:#dc2626;"><span class="icon">&#128308;</span> 使用中のIPアドレス ($($scanSummary.Used)件)</div>
+<div style="line-height:2.2;">
+$scanUsedHtml
+</div>
+</div>
+
+<div class="section">
+<div class="section-title" style="color:#059669;"><span class="icon">&#128994;</span> 空きIPアドレス ($($scanSummary.Available)件)</div>
+<div style="line-height:2.2;max-height:300px;overflow-y:auto;">
+$scanAvailHtml
+</div>
+<p style="font-size:11px;color:#94a3b8;margin-top:8px;">※ Pingに応答しないデバイスは「空き」として表示される場合があります。ファイアウォール等でICMP（Ping）がブロックされている端末が存在する可能性にご注意ください。</p>
+</div>
 </div>
 
 <!-- 手動入力セクション -->
@@ -370,7 +587,7 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; 
 </div>
 
 <div class="footer">
-ライフリズムナビ NW情報収集ツール v1.0 &mdash; エコナビスタ株式会社
+ライフリズムナビ NW情報収集ツール v1.1（IPスキャン対応） &mdash; エコナビスタ株式会社
 </div>
 
 </div>
@@ -405,6 +622,20 @@ function gatherText() {
     L.push('DNS（プライマリ）: $($ip.DNS1)');
     L.push('DNS（セカンダリ）: $($ip.DNS2)');
     L.push('DHCP: $($ip.DHCP)');
+    L.push('');
+    L.push('【IPアドレススキャン結果】');
+    L.push('スキャン範囲: $($scanSummary.NetworkAddr)/$($scanSummary.PrefixLength)');
+    L.push('ホスト数: $($scanSummary.Total)');
+    L.push('使用中: $($scanSummary.Used) / 空き: $($scanSummary.Available)');
+    L.push('スキャン時間: $($scanSummary.ScanTime)');
+    L.push('');
+    L.push('使用中IP:');
+    L.push('$(($scanUsedText | ForEach-Object { "  $_" }) -join "`n")');
+    L.push('');
+    L.push('空きIP:');
+    L.push('$(($scanAvailText | ForEach-Object { "  $_" }) -join "`n")');
+    L.push('');
+    L.push('※Ping非応答のデバイスは空きとして表示される場合があります');
     L.push('');
     L.push('【手動入力項目】');
     L.push('Wi-Fiパスワード: ' + v('wifiPass'));
