@@ -260,6 +260,7 @@ try {
         Write-Host ""
 
         # ARPテーブルも参照して補完（ping応答しないがARP応答するデバイス）
+        # dynamic = DHCP割当の可能性大 / static = 固定IP設定済みの可能性大
         Write-Host "  ARPテーブルを確認中..." -ForegroundColor Gray
         try {
             $arpOutput = arp -a 2>$null
@@ -268,11 +269,15 @@ try {
                     $arpIP = $Matches[1]
                     $arpMAC = $Matches[2]
                     $arpType = $Matches[3]
-                    if ($arpMAC -ne 'ff-ff-ff-ff-ff-ff' -and $arpType -ne 'static') {
-                        $existing = $scanResults | Where-Object { $_.IP -eq $arpIP }
-                        if ($existing -and $existing.Status -eq 'Available') {
+                    if ($arpMAC -eq 'ff-ff-ff-ff-ff-ff') { continue }
+                    $existing = $scanResults | Where-Object { $_.IP -eq $arpIP }
+                    if ($existing) {
+                        # 使用中補完（ping非応答でもARP応答があれば使用中）
+                        if ($existing.Status -eq 'Available' -and $arpType -ne 'static') {
                             $existing.Status = 'Used'
                         }
+                        # ARPタイプを記録（後段のDHCP推定に利用）
+                        $existing | Add-Member -NotePropertyName 'ArpType' -NotePropertyValue $arpType -Force
                     }
                 }
             }
@@ -294,6 +299,88 @@ try {
     }
 } catch {
     Write-Host "  ⚠ IPスキャン中にエラーが発生しました: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# =====================
+#  DHCP推定分析
+# =====================
+# IP数値変換ヘルパー
+function IntToIP([uint32]$n) {
+    "$([Math]::Floor($n/16777216)%256).$([Math]::Floor($n/65536)%256).$([Math]::Floor($n/256)%256).$($n%256)"
+}
+function IPToInt([string]$ip) {
+    $p = $ip -split '\.'
+    [uint32]$p[0]*16777216 + [uint32]$p[1]*65536 + [uint32]$p[2]*256 + [uint32]$p[3]
+}
+
+$dhcpAnalysisHtml = ""
+$ipMapHtml       = ""
+
+if ($scanResults.Count -gt 0) {
+    # ── ① IPアドレス分布マップ（16列グリッド）────────────────────
+    $usedIPSet = @{}
+    foreach ($r in ($scanResults | Where-Object { $_.Status -eq 'Used' })) {
+        $lastOctet = [int]($r.IP -split '\.')[-1]
+        $usedIPSet[$lastOctet] = $r
+    }
+    $prefix3 = ($scanSummary.NetworkAddr -replace '\.\d+$','')
+
+    $ipMapHtml = "<div style='font-family:monospace;font-size:13px;line-height:1.8;'>`n"
+    # 行ラベル付き16列グリッド
+    $ipMapHtml += "<div style='display:inline-grid;grid-template-columns:repeat(17,auto);gap:2px;align-items:center;'>`n"
+    for ($rowStart = 1; $rowStart -le 240; $rowStart += 16) {
+        # 行ラベル
+        $ipMapHtml += "<span style='color:#94a3b8;font-size:11px;padding-right:4px;'>.$rowStart</span>`n"
+        for ($i = 0; $i -lt 16; $i++) {
+            $n = $rowStart + $i
+            if ($n -gt 254) { $ipMapHtml += "<span></span>`n"; continue }
+            $tip = "$prefix3.$n"
+            $hn = if ($usedIPSet.ContainsKey($n) -and $usedIPSet[$n].Hostname) { " ($($usedIPSet[$n].Hostname))" } else { "" }
+            if ($usedIPSet.ContainsKey($n)) {
+                $ipMapHtml += "<span title='$tip$hn' style='display:inline-block;width:18px;height:18px;background:#fca5a5;border:1px solid #f87171;border-radius:3px;cursor:default;'></span>`n"
+            } else {
+                $ipMapHtml += "<span title='$tip' style='display:inline-block;width:18px;height:18px;background:#d1fae5;border:1px solid #6ee7b7;border-radius:3px;cursor:default;'></span>`n"
+            }
+        }
+    }
+    $ipMapHtml += "</div>`n"
+    $ipMapHtml += "<div style='margin-top:8px;font-size:11px;color:#64748b;'>
+      <span style='display:inline-block;width:12px;height:12px;background:#fca5a5;border:1px solid #f87171;border-radius:2px;vertical-align:middle;'></span> 使用中 &nbsp;
+      <span style='display:inline-block;width:12px;height:12px;background:#d1fae5;border:1px solid #6ee7b7;border-radius:2px;vertical-align:middle;'></span> 空き &nbsp;
+      ※ セルにカーソルを合わせるとIPアドレスが表示されます
+    </div></div>`n"
+
+    # ── ② 周囲から離れたIP（孤立IP検出・要目視確認）─────────────
+    $usedSorted = $usedIPSet.Keys | Sort-Object
+    $isolatedHtml = ""
+    $isolatedText = @()
+    if ($usedSorted.Count -gt 0) {
+        for ($i = 0; $i -lt $usedSorted.Count; $i++) {
+            $n = $usedSorted[$i]
+            $leftGap  = if ($i -gt 0) { $n - $usedSorted[$i-1] } else { 999 }
+            $rightGap = if ($i -lt $usedSorted.Count - 1) { $usedSorted[$i+1] - $n } else { 999 }
+            if ($leftGap -ge 5 -and $rightGap -ge 5) {
+                $hn = if ($usedIPSet[$n].Hostname) { " ($($usedIPSet[$n].Hostname))" } else { "" }
+                $isolatedHtml += "<span style='display:inline-block;background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;border-radius:4px;padding:2px 10px;margin:2px;font-size:13px;font-family:monospace;'>$prefix3.$n$hn</span>`n"
+                $isolatedText += "$prefix3.$n$hn"
+            }
+        }
+    }
+    if (-not $isolatedHtml) { $isolatedHtml = "<span style='color:#6b7280;font-size:13px;'>検出なし（全使用中IPが近接しています）</span>" }
+
+
+    $dhcpAnalysisHtml = @"
+<div style='margin-bottom:16px;'>
+  <div style='font-size:12px;font-weight:700;color:#1e293b;margin-bottom:8px;'>📍 IPアドレス分布マップ（赤=使用中 / 緑=空き）</div>
+  $ipMapHtml
+</div>
+<div style='margin-bottom:16px;padding:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;'>
+  <div style='font-size:12px;font-weight:700;color:#c2410c;margin-bottom:6px;'>🔍 周囲のIPと大きく離れているアドレス（前後5以上の空白）</div>
+  <div style='line-height:2.2;'>$isolatedHtml</div>
+  <div style='font-size:11px;color:#92400e;margin-top:6px;'>固定IPが設定されている可能性がありますが、断定はできません。ルーター管理画面での確認を推奨します。</div>
+</div>
+
+"@
 }
 
 # スキャン結果をHTML用に変数へ格納
@@ -440,6 +527,12 @@ $scanAvailHtml
 </div>
 <p style="font-size:11px;color:#94a3b8;margin-top:8px;">※ Pingに応答しないデバイスは「空き」として表示される場合があります。ファイアウォール等でICMP（Ping）がブロックされている端末が存在する可能性にご注意ください。</p>
 </div>
+
+<div class="section">
+<div class="section-title"><span class="icon">&#128268;</span> IPアドレス分布分析 <span class="auto-tag">&#10003; 自動解析</span></div>
+$dhcpAnalysisHtml
+</div>
+
 </div>
 
 <!-- 手動入力セクション -->
@@ -587,7 +680,7 @@ $scanAvailHtml
 </div>
 
 <div class="footer">
-ライフリズムナビ NW情報収集ツール v1.1（IPスキャン対応） &mdash; エコナビスタ株式会社
+ライフリズムナビ NW情報収集ツール v1.3（IP分布マップ対応） &mdash; エコナビスタ株式会社
 </div>
 
 </div>
@@ -636,6 +729,8 @@ function gatherText() {
     L.push('$(($scanAvailText | ForEach-Object { "  $_" }) -join "`n")');
     L.push('');
     L.push('※Ping非応答のデバイスは空きとして表示される場合があります');
+    L.push('');
+    L.push('【IP分布分析】');
     L.push('');
     L.push('【手動入力項目】');
     L.push('Wi-Fiパスワード: ' + v('wifiPass'));
