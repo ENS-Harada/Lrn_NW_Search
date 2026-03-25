@@ -40,7 +40,27 @@ try {
             if ($line -match '^\s+BSSID\s+:\s+(.+)$') { $wifi.BSSID = $Matches[1].Trim() }
             if ($line -match '認証\s+:\s+(.+)$' -or $line -match 'Authentication\s+:\s+(.+)$') { $wifi.Auth = $Matches[1].Trim() }
             if ($line -match '暗号\s+:\s+(.+)$' -or $line -match 'Cipher\s+:\s+(.+)$') { $wifi.Cipher = $Matches[1].Trim() }
-            if ($line -match 'シグナル\s+:\s+(.+)$' -or $line -match 'Signal\s+:\s+(.+)$') { $wifi.Signal = $Matches[1].Trim() }
+            if ($line -match 'シグナル\s+:\s+(.+)$' -or $line -match 'Signal\s+:\s+(.+)$') {
+                $rawSignal = $Matches[1].Trim()
+                # パーセンテージからRSSI(dBm)に変換: dBm = (% / 2) - 100
+                if ($rawSignal -match '(\d+)%') {
+                    $pct = [int]$Matches[1]
+                    $rssi = [math]::Round($pct / 2 - 100)
+                    # 品質ラベル（metageek基準 / LRN導入NW資料P27準拠）
+                    # -30dBm: Amazing / -67dBm: Very Good / -70dBm: Okay(GW最低ライン) / -80dBm: Not Good / -90dBm: Unusable
+                    if     ($rssi -ge -30) { $quality = "Amazing（素晴らしい）";   $qualityEn = "amazing" }
+                    elseif ($rssi -ge -67) { $quality = "Very Good（良好）";       $qualityEn = "verygood" }
+                    elseif ($rssi -ge -70) { $quality = "Okay（使用可能）";        $qualityEn = "okay" }
+                    elseif ($rssi -ge -80) { $quality = "Not Good（よくない）";    $qualityEn = "notgood" }
+                    else                   { $quality = "Unusable（使用不可）";    $qualityEn = "unusable" }
+                    $wifi.Signal = "$rssi dBm"
+                    $wifi.SignalRaw = $rssi
+                    $wifi.SignalQuality = $quality
+                    $wifi.SignalQualityEn = $qualityEn
+                } else {
+                    $wifi.Signal = $rawSignal
+                }
+            }
             if ($line -match '無線の種類\s+:\s+(.+)$' -or $line -match 'Radio type\s+:\s+(.+)$') { $wifi.RadioType = $Matches[1].Trim() }
             if ($line -match 'チャネル\s+:\s+(.+)$' -or $line -match 'Channel\s+:\s+(.+)$') {
                 if ($line -notmatch '無線|Radio') { $wifi.Channel = $Matches[1].Trim() }
@@ -477,7 +497,21 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; 
 <tr><td>SSID（ネットワーク名）</td><td>$($wifi.SSID)</td></tr>
 <tr><td>認証方式</td><td>$($wifi.Auth)</td></tr>
 <tr><td>暗号化方式</td><td>$($wifi.Cipher)</td></tr>
-<tr><td>電波強度</td><td>$($wifi.Signal)</td></tr>
+<tr><td>電波強度（RSSI）</td><td>$(if ($wifi.SignalRaw) {
+    # metageek基準 5段階の色分け
+    $rssiColor = switch ($wifi.SignalQualityEn) {
+        'amazing'  { '#10b981' }  # 緑
+        'verygood' { '#3b82f6' }  # 青
+        'okay'     { '#f59e0b' }  # 黄
+        'notgood'  { '#ef4444' }  # 赤
+        'unusable' { '#7f1d1d' }  # 暗赤
+        default    { '#64748b' }
+    }
+    $barWidth = [math]::Max(5, [math]::Min(100, (($wifi.SignalRaw + 100) * 1.5)))
+    # GW最低ライン(-70dBm)の注記
+    $gwNote = if ($wifi.SignalRaw -lt -70) { "<div style='margin-top:6px;padding:6px 10px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;font-size:11px;color:#991b1b;'>⚠ SleepSensorゲートウェイの最低要件 -70dBm を下回っています。AP増設や設置位置の見直しを検討してください。</div>" } elseif ($wifi.SignalRaw -ge -70 -and $wifi.SignalRaw -lt -67) { "<div style='margin-top:6px;padding:6px 10px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;font-size:11px;color:#92400e;'>△ GW最低ライン(-70dBm)付近です。余裕をもったAP配置を推奨します。</div>" } else { "" }
+    "<span style='font-size:18px;font-weight:700;color:$rssiColor;'>$($wifi.Signal)</span> <span style='display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;background:$rssiColor;margin-left:8px;vertical-align:middle;'>$($wifi.SignalQuality)</span><div style='margin-top:8px;'><div style='background:#e5e7eb;border-radius:4px;height:10px;width:200px;display:inline-block;vertical-align:middle;position:relative;'><div style='background:$rssiColor;border-radius:4px;height:10px;width:$($barWidth)%;'></div><div style='position:absolute;left:45%;top:-1px;width:2px;height:12px;background:#f59e0b;' title='GW最低ライン: -70dBm'></div></div> <span style='font-size:10px;color:#94a3b8;margin-left:4px;'>▲-70dBm(GW最低ライン)</span></div>$gwNote"
+} else { $wifi.Signal })</td></tr>
 <tr><td>無線規格</td><td>$($wifi.RadioType)</td></tr>
 <tr><td>チャネル</td><td>$($wifi.Channel)</td></tr>
 <tr><td>BSSID（APのMACアドレス）</td><td>$($wifi.BSSID)</td></tr>
@@ -680,7 +714,7 @@ $dhcpAnalysisHtml
 </div>
 
 <div class="footer">
-ライフリズムナビ NW情報収集ツール v1.3（IP分布マップ対応） &mdash; エコナビスタ株式会社
+ライフリズムナビ NW情報収集ツール v1.4（RSSI表示対応） &mdash; エコナビスタ株式会社
 </div>
 
 </div>
@@ -702,7 +736,7 @@ function gatherText() {
     L.push('SSID: $($wifi.SSID)');
     L.push('認証方式: $($wifi.Auth)');
     L.push('暗号化: $($wifi.Cipher)');
-    L.push('電波強度: $($wifi.Signal)');
+    L.push('電波強度（RSSI）: $($wifi.Signal) [$($wifi.SignalQuality)]');
     L.push('無線規格: $($wifi.RadioType)');
     L.push('チャネル: $($wifi.Channel)');
     L.push('BSSID: $($wifi.BSSID)');
